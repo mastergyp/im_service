@@ -19,7 +19,12 @@
 
 package main
 
-import "fmt"
+import (
+	"bytes"
+	"encoding/binary"
+	"encoding/hex"
+	"fmt"
+)
 import "time"
 import log "github.com/golang/glog"
 import "github.com/gomodule/redigo/redis"
@@ -95,38 +100,95 @@ func GetUserForbidden(appid int64, uid int64) (int, error) {
 	return forbidden, nil
 }
 
+func encodeAuthInfo(user_id int64, forbidden int, notification_on bool) ([]byte, error) {
+	buf := new(bytes.Buffer)
+	uid := int64(user_id)
+	err1 := binary.Write(buf, binary.BigEndian, uid)
+	if err1 != nil{
+		return nil, err1
+	}
+
+	err2 := binary.Write(buf, binary.BigEndian, forbidden == 1)
+	if err2 != nil{
+		return nil, err2
+	}
+
+	err3 := binary.Write(buf, binary.BigEndian, notification_on)
+	if err3 != nil{
+		return nil, err3
+	}
+	//fmt.Printf("% x", buf.Bytes())
+	return buf.Bytes(), nil
+}
+
+func decodeAuthInfo(r []byte) (int64, int, bool, error) {
+	switch len(r) {
+	case 0:
+		return 0, 0, false, errors.New("token non exists")
+	case 10:
+		buffer := bytes.NewBuffer(r)
+		var user_id int64
+		var fobidden bool
+		var notification_on bool
+		var b2i = map[bool]int{false: 0, true: 1}
+		binary.Read(buffer, binary.BigEndian, &user_id)
+		binary.Read(buffer, binary.BigEndian, &fobidden)
+		binary.Read(buffer, binary.BigEndian, &notification_on)
+		return user_id, b2i[fobidden], notification_on, nil
+	default:
+		return 0, 0, false, errors.New("token data error")
+	}
+
+}
+
+
 func LoadUserAccessToken(token string) (int64, int64, int, bool, error) {
 	conn := redis_pool.Get()
 	defer conn.Close()
 
-	key := fmt.Sprintf("access_token_%s", token)
+	key := "im_access_token"
+
 	var uid int64
-	var appid int64
-	var notification_on int8
+	var appid int64 = 1
+	var notification_on bool
 	var forbidden int
-	
-	exists, err := redis.Bool(conn.Do("EXISTS", key))
+
+	tokenHex, err := hex.DecodeString(token)
 	if err != nil {
-		return 0, 0, 0, false, err
-	}
-	if !exists {
-		return 0, 0, 0, false,  errors.New("token non exists")
+		// handle error
+		log.Warning("token string error:", err)
+		return 0, 0, 0, false,  errors.New("token format error")
 	}
 
-	reply, err := redis.Values(conn.Do("HMGET", key, "user_id",
-		"app_id", "notification_on", "forbidden"))
+	//exists, err := redis.Bool(conn.Do("EXISTS", key))
+	//if err != nil {
+	//	return 0, 0, 0, false, err
+	//}
+	//if !exists {
+	//	return 0, 0, 0, false,  errors.New("token non exists")
+	//}
+
+	reply, err := redis.Bytes(conn.Do("HGET", key, tokenHex))
+
 	if err != nil {
-		log.Info("hmget error:", err)
+		log.Info("hget error:", err)
 		return 0, 0, 0, false, err
 	}
 
-	_, err = redis.Scan(reply, &uid, &appid, &notification_on, &forbidden)
+	uid, forbidden, notification_on, err =  decodeAuthInfo(reply)
 	if err != nil {
 		log.Warning("scan error:", err)
 		return 0, 0, 0, false, err
 	}
+
+	//_, err = redis.Scan(reply, &uid, &appid, &notification_on, &forbidden)
+	//if err != nil {
+	//	log.Warning("scan error:", err)
+	//	return 0, 0, 0, false, err
+	//}
 	
-	return appid, uid, forbidden, notification_on != 0, nil	
+	return appid, uid, forbidden, notification_on, nil
+
 }
 
 func CountUser(appid int64, uid int64) {
