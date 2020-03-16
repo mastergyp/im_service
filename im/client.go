@@ -24,6 +24,8 @@ import "time"
 import "sync/atomic"
 import log "github.com/golang/glog"
 import "container/list"
+import "crypto/tls"
+import "fmt"
 
 type Client struct {
 	Connection//必须放在结构体首部
@@ -62,6 +64,70 @@ func NewClient(conn interface{}) *Client {
 	client.CustomerClient = NewCustomerClient(&client.Connection)
 	return client
 }
+
+func handle_client(conn net.Conn) {
+	log.Infoln("handle new connection, remote address:", conn.RemoteAddr())
+	client := NewClient(conn)
+	client.Run()
+}
+
+func handle_ssl_client(conn net.Conn) {
+	log.Infoln("handle new ssl connection,  remote address:", conn.RemoteAddr())
+	client := NewClient(conn)
+	client.Run()
+}
+
+
+func Listen(f func(net.Conn), port int) {
+	listen_addr := fmt.Sprintf("0.0.0.0:%d", port)
+	listen, err := net.Listen("tcp", listen_addr)
+	if err != nil {
+		log.Errorf("listen err:%s", err)
+		return
+	}
+	tcp_listener, ok := listen.(*net.TCPListener)
+	if !ok {
+		log.Error("listen err")
+		return
+	}
+
+	for {
+		client, err := tcp_listener.AcceptTCP()
+		if err != nil {
+			log.Errorf("accept err:%s", err)
+			return
+		}
+		f(client)
+	}
+}
+
+func ListenClient() {
+	Listen(handle_client, config.port)
+}
+
+func ListenSSL(port int, cert_file, key_file string) {
+	cert, err := tls.LoadX509KeyPair(cert_file, key_file)
+	if err != nil {
+		log.Fatal("load cert err:", err)
+		return
+	}
+	config := &tls.Config{Certificates: []tls.Certificate{cert}}
+	addr := fmt.Sprintf(":%d", port)
+	listen, err := tls.Listen("tcp", addr, config)
+	if err != nil {
+		log.Fatal("ssl listen err:", err)
+	}
+
+	log.Infof("ssl listen...")
+	for {
+		conn, err := listen.Accept()
+		if err != nil {
+			log.Fatal("ssl accept err:", err)
+		}
+		handle_ssl_client(conn)
+	}
+}
+
 
 func (client *Client) Read() {
 	for {
@@ -139,12 +205,17 @@ func (client *Client) HandleMessage(msg *Message) {
 
 
 func (client *Client) AuthToken(token string) (int64, int64, int, bool, error) {
-	appid, uid, forbidden, notification_on, err := LoadUserAccessToken(token)
+	appid, uid, err := LoadUserAccessToken(token)
 
 	if err != nil {
 		return 0, 0, 0, false, err
 	}
-
+	
+	forbidden, notification_on, err := GetUserPreferences(appid, uid)
+	if err != nil {
+		return 0, 0, 0, false, err
+	}
+	
 	return appid, uid, forbidden, notification_on, nil
 }
 
@@ -170,7 +241,7 @@ func (client *Client) HandleAuthToken(login *AuthenticationToken, version int) {
 		return
 	}
 
-	if login.platform_id != PLATFORM_WEB && len(login.device_id) > 0{
+	if login.platform_id != PLATFORM_WEB && len(login.device_id) > 0 {
 		client.device_ID, err = GetDeviceID(login.device_id, int(login.platform_id))
 		if err != nil {
 			log.Info("auth token uid==0")
@@ -247,9 +318,15 @@ func (client *Client) SendMessages(seq int) int {
 		if msg.cmd == MSG_RT || msg.cmd == MSG_IM || msg.cmd == MSG_GROUP_IM {
 			atomic.AddInt64(&server_summary.out_message_count, 1)
 		}
+		
+		if msg.meta != nil {
+			seq++
+			meta_msg := &Message{cmd:MSG_METADATA, seq:seq, version:client.version, body:msg.meta}
+			client.send(meta_msg)
+		}
 		seq++
 		//以当前客户端所用版本号发送消息
-		vmsg := &Message{msg.cmd, seq, client.version, msg.flag, msg.body}
+		vmsg := &Message{cmd:msg.cmd, seq:seq, version:client.version, flag:msg.flag, body:msg.body}
 		client.send(vmsg)
 		
 		e = e.Next()
@@ -274,20 +351,31 @@ func (client *Client) Write() {
 			if msg.cmd == MSG_RT || msg.cmd == MSG_IM || msg.cmd == MSG_GROUP_IM {
 				atomic.AddInt64(&server_summary.out_message_count, 1)
 			}
-			seq++
 
+			if msg.meta != nil {
+				seq++
+				meta_msg := &Message{cmd:MSG_METADATA, seq:seq, version:client.version, body:msg.meta}
+				client.send(meta_msg)
+			}
+			
+			seq++
 			//以当前客户端所用版本号发送消息
-			vmsg := &Message{msg.cmd, seq, client.version, msg.flag, msg.body}
+			vmsg := &Message{cmd:msg.cmd, seq:seq, version:client.version, flag:msg.flag, body:msg.body}
 			client.send(vmsg)
 		case messages := <- client.pwt:
 			for _, msg := range(messages) {
 				if msg.cmd == MSG_RT || msg.cmd == MSG_IM || msg.cmd == MSG_GROUP_IM {
 					atomic.AddInt64(&server_summary.out_message_count, 1)
 				}
-				seq++
 
+				if msg.meta != nil {
+					seq++
+					meta_msg := &Message{cmd:MSG_METADATA, seq:seq, version:client.version, body:msg.meta}
+					client.send(meta_msg)
+				}
+				seq++					
 				//以当前客户端所用版本号发送消息
-				vmsg := &Message{msg.cmd, seq, client.version, msg.flag, msg.body}
+				vmsg := &Message{cmd:msg.cmd, seq:seq, version:client.version, flag:msg.flag, body:msg.body}
 				client.send(vmsg)
 			}
 		case <- client.lwt:

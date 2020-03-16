@@ -19,12 +19,7 @@
 
 package main
 
-import (
-	"bytes"
-	"encoding/binary"
-	"encoding/hex"
-	"fmt"
-)
+import "fmt"
 import "time"
 import log "github.com/golang/glog"
 import "github.com/gomodule/redigo/redis"
@@ -84,111 +79,70 @@ func SaveGroupSyncKey(appid int64, uid int64, group_id int64, sync_key int64) {
 	}	
 }
 
-
-func GetUserForbidden(appid int64, uid int64) (int, error) {
+func GetUserPreferences(appid int64, uid int64) (int, bool, error) {
 	conn := redis_pool.Get()
 	defer conn.Close()
 
 	key := fmt.Sprintf("users_%d_%d", appid, uid)
 
-	forbidden, err := redis.Int(conn.Do("HGET", key, "forbidden"))
+	reply, err := redis.Values(conn.Do("HMGET", key, "forbidden", "notification_on"))
 	if err != nil {
 		log.Info("hget error:", err)
-		return 0,  err
+		return 0, false, err
 	}
+	
+	//电脑在线，手机新消息通知
+	var notification_on int
+	//用户禁言
+	var forbidden int	
+	_, err = redis.Scan(reply, &forbidden, &notification_on)
+	if err != nil {
+		log.Warning("scan error:", err)
+		return 0, false, err
+	}	
 
-	return forbidden, nil
+	return forbidden, notification_on != 0, nil
 }
 
-func encodeAuthInfo(user_id int64, forbidden int, notification_on bool) ([]byte, error) {
-	buf := new(bytes.Buffer)
-	uid := int64(user_id)
-	err1 := binary.Write(buf, binary.BigEndian, uid)
-	if err1 != nil{
-		return nil, err1
-	}
-
-	err2 := binary.Write(buf, binary.BigEndian, forbidden == 1)
-	if err2 != nil{
-		return nil, err2
-	}
-
-	err3 := binary.Write(buf, binary.BigEndian, notification_on)
-	if err3 != nil{
-		return nil, err3
-	}
-	//fmt.Printf("% x", buf.Bytes())
-	return buf.Bytes(), nil
-}
-
-func decodeAuthInfo(r []byte) (int64, int, bool, error) {
-	switch len(r) {
-	case 0:
-		return 0, 0, false, errors.New("token non exists")
-	case 10:
-		buffer := bytes.NewBuffer(r)
-		var user_id int64
-		var fobidden bool
-		var notification_on bool
-		var b2i = map[bool]int{false: 0, true: 1}
-		binary.Read(buffer, binary.BigEndian, &user_id)
-		binary.Read(buffer, binary.BigEndian, &fobidden)
-		binary.Read(buffer, binary.BigEndian, &notification_on)
-		return user_id, b2i[fobidden], notification_on, nil
-	default:
-		return 0, 0, false, errors.New("token data error")
-	}
-
-}
-
-
-func LoadUserAccessToken(token string) (int64, int64, int, bool, error) {
+func LoadUserAccessToken(token string) (int64, int64, error) {
 	conn := redis_pool.Get()
 	defer conn.Close()
 
-	key := "im_access_token"
-
+	key := fmt.Sprintf("access_token_%s", token)
 	var uid int64
-	var appid int64 = 1
-	var notification_on bool
-	var forbidden int
+	var appid int64
 
-	tokenHex, err := hex.DecodeString(token)
+	err := conn.Send("EXISTS", key)
 	if err != nil {
-		// handle error
-		log.Warning("token string error:", err)
-		return 0, 0, 0, false,  errors.New("token format error")
+		return 0, 0, err
+	}
+	err = conn.Send("HMGET", key, "user_id", "app_id")
+	if err != nil {
+		return 0, 0, err
+	}
+	err = conn.Flush()
+	if err != nil {
+		return 0, 0, err
 	}
 
-	//exists, err := redis.Bool(conn.Do("EXISTS", key))
-	//if err != nil {
-	//	return 0, 0, 0, false, err
-	//}
-	//if !exists {
-	//	return 0, 0, 0, false,  errors.New("token non exists")
-	//}
-
-	reply, err := redis.Bytes(conn.Do("HGET", key, tokenHex))
-
+	exists, err := redis.Bool(conn.Receive())
 	if err != nil {
-		log.Info("hget error:", err)
-		return 0, 0, 0, false, err
+		return 0, 0, err
 	}
-
-	uid, forbidden, notification_on, err =  decodeAuthInfo(reply)
+	reply, err := redis.Values(conn.Receive())
 	if err != nil {
-		log.Warning("scan error:", err)
-		return 0, 0, 0, false, err
+		return 0, 0, err
 	}
-
-	//_, err = redis.Scan(reply, &uid, &appid, &notification_on, &forbidden)
-	//if err != nil {
-	//	log.Warning("scan error:", err)
-	//	return 0, 0, 0, false, err
-	//}
 	
-	return appid, uid, forbidden, notification_on, nil
-
+	if !exists {
+		return 0, 0, errors.New("token non exists")
+	}
+	_, err = redis.Scan(reply, &uid, &appid)
+	if err != nil {
+		return 0, 0, err
+	}
+	
+	return appid, uid, nil	
 }
 
 func CountUser(appid int64, uid int64) {
@@ -225,3 +179,4 @@ func SetUserUnreadCount(appid int64, uid int64, count int32) {
 		log.Info("hset err:", err)
 	}
 }
+
